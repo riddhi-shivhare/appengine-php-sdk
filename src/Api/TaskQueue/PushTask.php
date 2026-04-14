@@ -64,6 +64,7 @@ final class PushTask {
     'method'        => 'POST',
     'name'          => '',
     'header'        => '',
+    'retry_config'  => [],
   ];
 
   private $url;
@@ -171,6 +172,26 @@ final class PushTask {
           ' (30 days). delay_seconds: ' . $delay);
     }
 
+    $retry_config = $this->options['retry_config'];
+    if (!is_array($retry_config)) {
+      throw new \InvalidArgumentException('retry_config must be an array.');
+    }
+    if (!empty($retry_config)) {
+      if (isset($retry_config['max_attempts']) && !is_int($retry_config['max_attempts'])) {
+        throw new \InvalidArgumentException('max_attempts must be an integer.');
+      }
+      if (isset($retry_config['min_backoff'])) {
+        if (!is_array($retry_config['min_backoff']) || !isset($retry_config['min_backoff']['seconds']) || !is_int($retry_config['min_backoff']['seconds'])) {
+          throw new \InvalidArgumentException('min_backoff must be an array with an integer "seconds" field.');
+        }
+      }
+      if (isset($retry_config['max_backoff'])) {
+        if (!is_array($retry_config['max_backoff']) || !isset($retry_config['max_backoff']['seconds']) || !is_int($retry_config['max_backoff']['seconds'])) {
+          throw new \InvalidArgumentException('max_backoff must be an array with an integer "seconds" field.');
+        }
+      }
+    }
+
     $this->query_data = $query_data;
     $this->url = $url_path;
     if ($query_data) {
@@ -273,6 +294,15 @@ final class PushTask {
    */
   public function getHeaders() {
     return $this->headers;
+  }
+
+  /**
+   * Return the task's retry config.
+   *
+   * @return array The task's retry config.
+   */
+  public function getRetryConfig() {
+    return $this->options['retry_config'];
   }
 
   /**

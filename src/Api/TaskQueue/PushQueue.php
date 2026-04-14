@@ -40,6 +40,9 @@ final class PushQueue {
    */
   const MAX_TASKS_PER_ADD = 100;
 
+  const GAE_PUSHQUEUE_BACKEND = 'GAE_PUSHQUEUE_BACKEND';
+  const CLOUD_TASK_BACKEND = 'CLOUD_TASK';
+
   private $name;
 
   private static $methods = [
@@ -147,6 +150,15 @@ final class PushQueue {
           '$tasks must contain at most ' . self::MAX_TASKS_PER_ADD .
           ' tasks. Actual size: ' . count($tasks));
     }
+
+    $backend = getenv(self::GAE_PUSHQUEUE_BACKEND);
+    if ($backend === self::CLOUD_TASK_BACKEND) {
+      if (count($tasks) > 1) {
+        throw new \RuntimeException('Batch operations are not supported for Cloud Tasks backend yet.');
+      }
+      return [$this->createCloudTask($tasks[0])];
+    }
+
     $req = new TaskQueueBulkAddRequest();
     $resp = new TaskQueueBulkAddResponse();
 
@@ -211,5 +223,97 @@ final class PushQueue {
       throw $exception;
     }
     return $names;
+  }
+
+  /**
+   * Create a task using Cloud Tasks API.
+   *
+   * @param PushTask $task The task to create.
+   * @return string The name of the created task.
+   * @throws TaskQueueException if there was a problem using the service.
+   */
+  private function createCloudTask(PushTask $task) {
+    $projectId = \Google\AppEngine\Api\AppIdentity\AppIdentityService::getApplicationId();
+    $location = getenv('GAE_LOCATION');
+    if (!$location) {
+      throw new \RuntimeException('GAE_LOCATION environment variable is not set.');
+    }
+    $queue = $this->name;
+    
+    $accessTokenData = \Google\AppEngine\Api\AppIdentity\AppIdentityService::getAccessToken(['https://www.googleapis.com/auth/cloud-platform']);
+    $token = $accessTokenData['access_token'];
+    
+    $url = sprintf('https://cloudtasks.googleapis.com/v2beta2/projects/%s/locations/%s/queues/%s/tasks', $projectId, $location, $queue);
+    
+    $client = new \GuzzleHttp\Client();
+    
+    $body = [
+      'task' => [
+        'appEngineHttpRequest' => [
+          'httpMethod' => $task->getMethod(),
+          'relativeUri' => $task->getUrl(),
+        ]
+      ]
+    ];
+    
+    $retryConfig = $task->getRetryConfig();
+    if (!empty($retryConfig)) {
+      $body['task']['retryConfig'] = [];
+      if (isset($retryConfig['max_attempts'])) {
+        $body['task']['retryConfig']['maxAttempts'] = $retryConfig['max_attempts'];
+      }
+      if (isset($retryConfig['min_backoff'])) {
+        $body['task']['retryConfig']['minBackoff'] = $retryConfig['min_backoff']['seconds'] . 's';
+      }
+      if (isset($retryConfig['max_backoff'])) {
+        $body['task']['retryConfig']['maxBackoff'] = $retryConfig['max_backoff']['seconds'] . 's';
+      }
+    }
+    
+    $headers = [];
+    foreach ($task->getHeaders() as $header) {
+      $pair = explode(':', $header, 2);
+      $headers[trim($pair[0])] = trim($pair[1]);
+    }
+    
+    if (!empty($headers)) {
+      $body['task']['appEngineHttpRequest']['headers'] = $headers;
+    }
+    
+    if ($task->getMethod() == 'POST' || $task->getMethod() == 'PUT') {
+      if ($task->getQueryData()) {
+        $body['task']['appEngineHttpRequest']['body'] = base64_encode(http_build_query($task->getQueryData()));
+      }
+    }
+    
+    if ($task->getName()) {
+      $body['task']['name'] = sprintf('projects/%s/locations/%s/queues/%s/tasks/%s', $projectId, $location, $queue, $task->getName());
+    }
+    
+    if ($task->getDelaySeconds() > 0) {
+      $eta = time() + $task->getDelaySeconds();
+      $body['task']['scheduleTime'] = gmdate('Y-m-d\TH:i:s\Z', $eta);
+    }
+    
+    try {
+      $response = $client->post($url, [
+        'headers' => [
+          'Authorization' => 'Bearer ' . $token,
+          'Content-Type' => 'application/json',
+        ],
+        'json' => $body,
+      ]);
+      
+      $respBody = json_decode($response->getBody(), true);
+      $fullName = $respBody['name'];
+      $parts = explode('/', $fullName);
+      return end($parts);
+      
+    } catch (\GuzzleHttp\Exception\RequestException $e) {
+      if ($e->getResponse() && $e->getResponse()->getStatusCode() == 409) {
+        throw new TaskAlreadyExistsException('Task with the same name exists already');
+      }
+      throw new TaskQueueException('Cloud Tasks API error: ' . $e->getMessage());
+    }
   }
 }
