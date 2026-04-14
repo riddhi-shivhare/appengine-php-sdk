@@ -45,6 +45,9 @@ final class PushQueue {
 
   private $name;
 
+  // The Guzzle Client used to make http requests.
+  private $guzzle_client = null;
+
   private static $methods = [
     'POST' => RequestMethod::POST,
     'GET' => RequestMethod::GET,
@@ -57,14 +60,21 @@ final class PushQueue {
    * Construct a PushQueue
    *
    * @param string $name The name of the queue.
+   * @param \GuzzleHttp\Client $mock_client Mocked Guzzle Client used to make http requests.
    */
-  public function __construct($name = 'default') {
+  public function __construct($name = 'default', $mock_client = null) {
     if (!is_string($name)) {
       throw new \InvalidArgumentException(
           '$name must be a string. Actual type: ' . gettype($name));
     }
     # TODO: validate queue name length and regex.
     $this->name = $name;
+
+    if (isset($mock_client)) {
+      $this->guzzle_client = $mock_client;
+    } else {
+      $this->guzzle_client = new \GuzzleHttp\Client();
+    }
   }
 
   /**
@@ -245,8 +255,6 @@ final class PushQueue {
     
     $url = sprintf('https://cloudtasks.googleapis.com/v2beta2/projects/%s/locations/%s/queues/%s/tasks', $projectId, $location, $queue);
     
-    $client = new \GuzzleHttp\Client();
-    
     $body = [
       'task' => [
         'appEngineHttpRequest' => [
@@ -296,7 +304,7 @@ final class PushQueue {
     }
     
     try {
-      $response = $client->post($url, [
+      $response = $this->guzzle_client->post($url, [
         'headers' => [
           'Authorization' => 'Bearer ' . $token,
           'Content-Type' => 'application/json',
