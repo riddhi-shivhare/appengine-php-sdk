@@ -278,7 +278,186 @@ class PushQueueTest extends ApiProxyTestBase {
     $this->apiProxyMock->verify();
   }
 
+  private static function ensureCloudTasksV2StubsLoaded() {
+    if (!class_exists('\Google\Protobuf\Timestamp')) {
+      eval('
+        namespace Google\Protobuf;
+        class Timestamp {
+          private $seconds = 0;
+          public function setSeconds($s) { $this->seconds = $s; return $this; }
+          public function getSeconds() { return $this->seconds; }
+        }
+      ');
+    }
+    if (!class_exists('\Google\Rpc\Status')) {
+      eval('
+        namespace Google\Rpc;
+        class Status {
+          private $code = 0;
+          private $message = "";
+          public function setCode($c) { $this->code = $c; return $this; }
+          public function getCode() { return $this->code; }
+          public function setMessage($m) { $this->message = $m; return $this; }
+          public function getMessage() { return $this->message; }
+        }
+      ');
+    }
+    if (!class_exists('\Google\ApiCore\ApiException')) {
+      eval('
+        namespace Google\ApiCore;
+        class ApiException extends \Exception {
+          private $status;
+          public function __construct($message, $code, $status = "") {
+            parent::__construct($message, $code);
+            $this->status = $status;
+          }
+          public function getStatus() { return $this->status; }
+        }
+      ');
+    }
+    if (!class_exists('\Google\Cloud\Tasks\V2\Task')) {
+      eval('
+        namespace Google\Cloud\Tasks\V2;
+        class AppEngineHttpRequest {
+          private $relativeUri = "/";
+          private $httpMethod = 1;
+          private $headers;
+          private $body = "";
+          public function __construct() { $this->headers = new \ArrayObject(); }
+          public function setRelativeUri($u) { $this->relativeUri = $u; return $this; }
+          public function getRelativeUri() { return $this->relativeUri; }
+          public function setHttpMethod($m) { $this->httpMethod = $m; return $this; }
+          public function getHttpMethod() { return $this->httpMethod; }
+          public function getHeaders() { return $this->headers; }
+          public function setBody($b) { $this->body = $b; return $this; }
+          public function getBody() { return $this->body; }
+        }
+        class Task {
+          private $name = "";
+          private $appEngineHttpRequest = null;
+          private $scheduleTime = null;
+          public function setName($n) { $this->name = $n; return $this; }
+          public function getName() { return $this->name; }
+          public function setAppEngineHttpRequest($r) { $this->appEngineHttpRequest = $r; return $this; }
+          public function getAppEngineHttpRequest() { return $this->appEngineHttpRequest; }
+          public function setScheduleTime($t) { $this->scheduleTime = $t; return $this; }
+          public function getScheduleTime() { return $this->scheduleTime; }
+        }
+        class CreateTaskRequest {
+          private $parent = "";
+          private $task = null;
+          public function setParent($p) { $this->parent = $p; return $this; }
+          public function getParent() { return $this->parent; }
+          public function setTask($t) { $this->task = $t; return $this; }
+          public function getTask() { return $this->task; }
+        }
+        class BatchCreateTasksRequest {
+          private $parent = "";
+          private $requests = [];
+          public function setParent($p) { $this->parent = $p; return $this; }
+          public function getParent() { return $this->parent; }
+          public function setRequests($r) { $this->requests = $r; return $this; }
+          public function getRequests() { return $this->requests; }
+        }
+        class BatchCreateTasksResponse {
+          private $tasks = [];
+          public function setTasks($t) { $this->tasks = $t; return $this; }
+          public function getTasks() { return $this->tasks; }
+        }
+        class BatchCreateTasksMetadata {
+          private $failedRequests = [];
+          public function setFailedRequests($f) { $this->failedRequests = $f; return $this; }
+          public function getFailedRequests() { return $this->failedRequests; }
+        }
+      ');
+    }
+    if (!class_exists('\Google\Cloud\Tasks\V2\Client\CloudTasksClient')) {
+      eval('
+        namespace Google\Cloud\Tasks\V2\Client;
+        class CloudTasksClient {
+          public function createTask($req) {}
+          public function batchCreateTasks($req) {}
+          public function close() {}
+        }
+      ');
+    }
+  }
+
+  public function testCloudTasksV2SingleCreateTask() {
+    self::ensureCloudTasksV2StubsLoaded();
+    putenv('APPENGINE_USE_CLOUDTASK_PUSH_QUEUE=true');
+    putenv('GOOGLE_CLOUD_PROJECT=test-proj');
+    putenv('LOCATION_ID=us-central1');
+    try {
+      $capturedReq = null;
+      PushQueue::setCloudTasksClientFactory(function ($className) use (&$capturedReq) {
+        return new class($capturedReq) {
+          private $capturedReqRef;
+          public function __construct(&$ref) { $this->capturedReqRef = &$ref; }
+          public function createTask($req) {
+            $this->capturedReqRef = $req;
+            return (new \Google\Cloud\Tasks\V2\Task())
+                ->setName('projects/test-proj/locations/us-central1/queues/default/tasks/single-1');
+          }
+          public function close() {}
+        };
+      });
+
+      $task = new PushTask('/worker/push', ['foo' => 'bar'], [
+        'name' => 'single-1',
+        'delay_seconds' => 30,
+      ]);
+      $queue = new PushQueue('default');
+      $names = $queue->addTasks([$task]);
+      $this->assertEquals(['single-1'], $names);
+      $this->assertNotNull($capturedReq);
+      $this->assertEquals(
+          'projects/test-proj/locations/us-central1/queues/default',
+          $capturedReq->getParent());
+      $ctTask = $capturedReq->getTask();
+      $this->assertEquals(
+          'projects/test-proj/locations/us-central1/queues/default/tasks/single-1',
+          $ctTask->getName());
+      $this->assertEquals('/worker/push', $ctTask->getAppEngineHttpRequest()->getRelativeUri());
+      $this->assertEquals('foo=bar', $ctTask->getAppEngineHttpRequest()->getBody());
+      $this->assertNotNull($ctTask->getScheduleTime());
+    } finally {
+      PushQueue::setCloudTasksClientFactory(null);
+      putenv('APPENGINE_USE_CLOUDTASK_PUSH_QUEUE');
+      putenv('GOOGLE_CLOUD_PROJECT');
+      putenv('LOCATION_ID');
+    }
+  }
+
+  public function testCloudTasksV2SingleCreateTaskAlreadyExists() {
+    self::ensureCloudTasksV2StubsLoaded();
+    putenv('APPENGINE_USE_CLOUDTASK_PUSH_QUEUE=true');
+    putenv('GOOGLE_CLOUD_PROJECT=test-proj');
+    putenv('LOCATION_ID=us-central1');
+    try {
+      PushQueue::setCloudTasksClientFactory(function ($className) {
+        return new class {
+          public function createTask($req) {
+            throw new \Google\ApiCore\ApiException('Task already exists', 409, 'ALREADY_EXISTS');
+          }
+          public function close() {}
+        };
+      });
+
+      $this->expectException('\Google\AppEngine\Api\TaskQueue\TaskAlreadyExistsException');
+      $task = new PushTask('/worker/push', [], ['name' => 'dup-single']);
+      $queue = new PushQueue('default');
+      $queue->addTasks([$task]);
+    } finally {
+      PushQueue::setCloudTasksClientFactory(null);
+      putenv('APPENGINE_USE_CLOUDTASK_PUSH_QUEUE');
+      putenv('GOOGLE_CLOUD_PROJECT');
+      putenv('LOCATION_ID');
+    }
+  }
+
   public function testCloudTasksV2BatchCreateTasksViaGetResult() {
+    self::ensureCloudTasksV2StubsLoaded();
     putenv('APPENGINE_USE_CLOUDTASK_PUSH_QUEUE=true');
     putenv('GOOGLE_CLOUD_PROJECT=test-proj');
     putenv('LOCATION_ID=us-central1');
@@ -321,6 +500,7 @@ class PushQueueTest extends ApiProxyTestBase {
   }
 
   public function testCloudTasksV2BatchCreateTasksFailedRequestsAlreadyExists() {
+    self::ensureCloudTasksV2StubsLoaded();
     putenv('APPENGINE_USE_CLOUDTASK_PUSH_QUEUE=true');
     putenv('GOOGLE_CLOUD_PROJECT=test-proj');
     putenv('LOCATION_ID=us-central1');
@@ -355,6 +535,49 @@ class PushQueueTest extends ApiProxyTestBase {
       $task1 = new PushTask('/url1');
       $task2 = new PushTask('/url2', [], ['name' => 'dup-task']);
       $queue = new PushQueue('default');
+      $queue->addTasks([$task1, $task2]);
+    } finally {
+      PushQueue::setCloudTasksClientFactory(null);
+      putenv('APPENGINE_USE_CLOUDTASK_PUSH_QUEUE');
+      putenv('GOOGLE_CLOUD_PROJECT');
+      putenv('LOCATION_ID');
+    }
+  }
+
+  public function testCloudTasksV2BatchCreateTasksFailedRequestsUnknownQueue() {
+    self::ensureCloudTasksV2StubsLoaded();
+    putenv('APPENGINE_USE_CLOUDTASK_PUSH_QUEUE=true');
+    putenv('GOOGLE_CLOUD_PROJECT=test-proj');
+    putenv('LOCATION_ID=us-central1');
+    try {
+      PushQueue::setCloudTasksClientFactory(function ($className) {
+        return new class {
+          public function batchCreateTasks($req) {
+            return new class {
+              public function isDone() { return true; }
+              public function pollUntilComplete() { return true; }
+              public function operationFailed() { return false; }
+              public function getMetadata() {
+                $st = (new \Google\Rpc\Status())
+                    ->setCode(5)
+                    ->setMessage('Queue does not exist');
+                return (new \Google\Cloud\Tasks\V2\BatchCreateTasksMetadata())
+                    ->setFailedRequests([0 => $st]);
+              }
+              public function getResult() {
+                return new \Google\Cloud\Tasks\V2\BatchCreateTasksResponse();
+              }
+            };
+          }
+          public function close() {}
+        };
+      });
+
+      $this->expectException('\Google\AppEngine\Api\TaskQueue\TaskQueueException');
+      $this->expectExceptionMessage('Unknown queue');
+      $task1 = new PushTask('/url1');
+      $task2 = new PushTask('/url2');
+      $queue = new PushQueue('missing-queue');
       $queue->addTasks([$task1, $task2]);
     } finally {
       PushQueue::setCloudTasksClientFactory(null);
