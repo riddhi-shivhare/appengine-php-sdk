@@ -50,6 +50,19 @@ final class PushQueue {
     'DELETE' => RequestMethod::DELETE
   ];
 
+  private static $cloudTasksClientFactory = null;
+
+  public static function setCloudTasksClientFactory($factory) {
+    self::$cloudTasksClientFactory = $factory;
+  }
+
+  private static function newCloudTasksClient($clientClass) {
+    if (self::$cloudTasksClientFactory !== null) {
+      return call_user_func(self::$cloudTasksClientFactory, $clientClass);
+    }
+    return new $clientClass();
+  }
+
   /**
    * Construct a PushQueue
    *
@@ -147,6 +160,13 @@ final class PushQueue {
           '$tasks must contain at most ' . self::MAX_TASKS_PER_ADD .
           ' tasks. Actual size: ' . count($tasks));
     }
+    foreach ($tasks as $task) {
+      if (!($task instanceof PushTask)) {
+        throw new \InvalidArgumentException(
+            'All values in $tasks must be instances of PushTask. ' .
+            'Actual type: ' . gettype($task));
+      }
+    }
 
     $useCloudTasks = getenv('GAE_PUSHQUEUE_BACKEND') === 'CLOUD_TASK' ||
         strtolower((string) getenv('APPENGINE_USE_CLOUDTASK_PUSH_QUEUE')) === 'true' ||
@@ -161,11 +181,6 @@ final class PushQueue {
     $names = [];
     $current_time = microtime(true);
     foreach ($tasks as $task) {
-      if (!($task instanceof PushTask)) {
-        throw new \InvalidArgumentException(
-            'All values in $tasks must be instances of PushTask. ' .
-            'Actual type: ' . gettype($task));
-      }
       $names[] = $task->getName();
       $add = $req->addAddRequest();
       $add->setQueueName($this->name);
@@ -236,15 +251,16 @@ final class PushQueue {
   }
 
   private static function getRegion() {
+    $envRegion = getenv('LOCATION_ID') ?: getenv('GAE_LOCATION') ?: getenv('GAE_REGION') ?: getenv('REGION_ID');
+    if ($envRegion) {
+      return $envRegion;
+    }
     static $region = null;
     if ($region === null) {
-        $region = getenv('LOCATION_ID') ?: getenv('GAE_LOCATION') ?: getenv('GAE_REGION') ?: getenv('REGION_ID');
-        if (!$region) {
-            $regionPath = self::getMetadataValue('instance/region');
-            if ($regionPath) {
-                $parts = explode('/', $regionPath);
-                $region = end($parts);
-            }
+        $regionPath = self::getMetadataValue('instance/region');
+        if ($regionPath) {
+            $parts = explode('/', $regionPath);
+            $region = end($parts);
         }
         if (!$region) {
             $region = getenv('LOCAL_GCP_REGION') ?: 'us-central1';
@@ -254,12 +270,13 @@ final class PushQueue {
   }
 
   private static function getProjectId() {
+    $envProject = getenv('GOOGLE_CLOUD_PROJECT');
+    if ($envProject) {
+      return $envProject;
+    }
     static $projectId = null;
     if ($projectId === null) {
-        $projectId = getenv('GOOGLE_CLOUD_PROJECT');
-        if (!$projectId) {
-            $projectId = self::getMetadataValue('project/project-id');
-        }
+        $projectId = self::getMetadataValue('project/project-id');
         if (!$projectId) {
             $appId = ApiProxy::getCurrentAppId();
             if (($pos = strpos($appId, '~')) !== false) {
@@ -425,7 +442,7 @@ final class PushQueue {
   private function createSingleTaskCloudTasks($task, $fullQueueName) {
     if (class_exists('\Google\Cloud\Tasks\V2\Client\CloudTasksClient')) {
       $taskObj = $this->buildCloudTaskObjV2($task, $fullQueueName);
-      $client = new \Google\Cloud\Tasks\V2\Client\CloudTasksClient();
+      $client = self::newCloudTasksClient('\Google\Cloud\Tasks\V2\Client\CloudTasksClient');
       $createTaskReq = (new \Google\Cloud\Tasks\V2\CreateTaskRequest())
           ->setParent($fullQueueName)
           ->setTask($taskObj);
@@ -443,7 +460,7 @@ final class PushQueue {
       }
     } elseif (class_exists('\Google\Cloud\Tasks\V2\CloudTasksClient')) {
       $taskObj = $this->buildCloudTaskObjV2($task, $fullQueueName);
-      $client = new \Google\Cloud\Tasks\V2\CloudTasksClient();
+      $client = self::newCloudTasksClient('\Google\Cloud\Tasks\V2\CloudTasksClient');
       try {
         $response = $client->createTask($fullQueueName, $taskObj);
         $parts = explode('/', $response->getName());
@@ -458,7 +475,7 @@ final class PushQueue {
       }
     } elseif (class_exists('\Google\Cloud\Tasks\V2beta3\Client\CloudTasksClient')) {
       $taskObj = $this->buildCloudTaskObjV2beta3($task, $fullQueueName);
-      $client = new \Google\Cloud\Tasks\V2beta3\Client\CloudTasksClient();
+      $client = self::newCloudTasksClient('\Google\Cloud\Tasks\V2beta3\Client\CloudTasksClient');
       $createTaskReq = (new \Google\Cloud\Tasks\V2beta3\CreateTaskRequest())
           ->setParent($fullQueueName)
           ->setTask($taskObj);
@@ -476,7 +493,7 @@ final class PushQueue {
       }
     } elseif (class_exists('\Google\Cloud\Tasks\V2beta3\CloudTasksClient')) {
       $taskObj = $this->buildCloudTaskObjV2beta3($task, $fullQueueName);
-      $client = new \Google\Cloud\Tasks\V2beta3\CloudTasksClient();
+      $client = self::newCloudTasksClient('\Google\Cloud\Tasks\V2beta3\CloudTasksClient');
       try {
         $response = $client->createTask($fullQueueName, $taskObj);
         $parts = explode('/', $response->getName());
@@ -491,6 +508,58 @@ final class PushQueue {
       }
     }
     throw new TaskQueueException('Cloud Tasks Client SDK is not available.');
+  }
+
+  private static function processBatchCreateResponse($response, $chunk, &$names) {
+    if (method_exists($response, 'pollUntilComplete') && !$response->isDone()) {
+      $response->pollUntilComplete();
+    }
+
+    $metadata = method_exists($response, 'getMetadata') ? $response->getMetadata() : null;
+    $failedRequests = ($metadata && method_exists($metadata, 'getFailedRequests')) ? $metadata->getFailedRequests() : null;
+    $exception = null;
+    if ($failedRequests) {
+      foreach ($chunk as $idx => $task) {
+        $hasFailure = (is_array($failedRequests) && isset($failedRequests[$idx])) ||
+            (is_object($failedRequests) && method_exists($failedRequests, 'offsetExists') && $failedRequests->offsetExists($idx));
+        if ($hasFailure) {
+          $errStatus = is_array($failedRequests) ? $failedRequests[$idx] : $failedRequests->offsetGet($idx);
+          $code = ($errStatus && method_exists($errStatus, 'getCode')) ? $errStatus->getCode() : 0;
+          if ($code !== 0) {
+            $msg = ($errStatus && method_exists($errStatus, 'getMessage')) ? $errStatus->getMessage() : '';
+            if (self::isAlreadyExistsError($code, $msg)) {
+              $exception = new TaskAlreadyExistsException('Task exists already: ' . $msg);
+            } elseif (stripos($msg, 'queue does not exist') !== false || stripos($msg, 'queue no longer exists') !== false) {
+              throw new TaskQueueException('Unknown queue: ' . $msg);
+            } else {
+              throw new TaskQueueException('Task creation failed: ' . $msg);
+            }
+          }
+        }
+      }
+    }
+    if ($exception !== null) {
+      throw $exception;
+    }
+
+    if (method_exists($response, 'operationFailed') && $response->operationFailed()) {
+      $errStatus = method_exists($response, 'getError') ? $response->getError() : null;
+      $code = ($errStatus && method_exists($errStatus, 'getCode')) ? $errStatus->getCode() : 0;
+      $msg = ($errStatus && method_exists($errStatus, 'getMessage')) ? $errStatus->getMessage() : 'Batch operation failed';
+      if (self::isAlreadyExistsError($code, $msg)) {
+        throw new TaskAlreadyExistsException('Task exists already: ' . $msg);
+      }
+      throw new TaskQueueException('Task creation failed: ' . $msg);
+    }
+
+    $resObj = method_exists($response, 'getResult') ? $response->getResult() :
+        (method_exists($response, 'getResponse') ? $response->getResponse() : $response);
+    if ($resObj && method_exists($resObj, 'getTasks')) {
+      foreach ($resObj->getTasks() as $resTask) {
+        $parts = explode('/', $resTask->getName());
+        $names[] = end($parts);
+      }
+    }
   }
 
   private function addTasksCloudTasks($tasks) {
@@ -524,7 +593,7 @@ final class PushQueue {
           $createTaskRequests[] = $createTaskReq;
         }
 
-        $client = new $v2ClientClass();
+        $client = self::newCloudTasksClient($v2ClientClass);
         try {
           if (class_exists('\Google\Cloud\Tasks\V2\BatchCreateTasksRequest')) {
             $batchReq = (new \Google\Cloud\Tasks\V2\BatchCreateTasksRequest())
@@ -539,16 +608,7 @@ final class PushQueue {
             $response = $client->batchCreateTasks($fullQueueName, $createTaskRequests);
           }
 
-          if (method_exists($response, 'pollUntilComplete') && !$response->isDone()) {
-            $response->pollUntilComplete();
-          }
-          $resObj = method_exists($response, 'getResponse') ? $response->getResponse() : $response;
-          if ($resObj && method_exists($resObj, 'getTasks')) {
-            foreach ($resObj->getTasks() as $resTask) {
-              $parts = explode('/', $resTask->getName());
-              $names[] = end($parts);
-            }
-          }
+          self::processBatchCreateResponse($response, $chunk, $names);
         } catch (\Google\ApiCore\ApiException $e) {
           if ($e->getStatus() === 'ALREADY_EXISTS' || $e->getCode() === 409 || self::isAlreadyExistsError($e->getCode(), $e->getMessage())) {
             throw new TaskAlreadyExistsException('Task exists already: ' . $e->getMessage());
@@ -580,7 +640,7 @@ final class PushQueue {
           $createTaskRequests[] = $createTaskReq;
         }
 
-        $client = new $betaClientClass();
+        $client = self::newCloudTasksClient($betaClientClass);
         try {
           if (class_exists('\Google\Cloud\Tasks\V2beta3\BatchCreateTasksRequest')) {
             $batchReq = (new \Google\Cloud\Tasks\V2beta3\BatchCreateTasksRequest())
@@ -595,36 +655,7 @@ final class PushQueue {
             $response = $client->batchCreateTasks($fullQueueName, $createTaskRequests);
           }
 
-          if (method_exists($response, 'pollUntilComplete') && !$response->isDone()) {
-            $response->pollUntilComplete();
-          }
-          $resObj = method_exists($response, 'getResponse') ? $response->getResponse() : $response;
-          if ($resObj && method_exists($resObj, 'getTasks')) {
-            foreach ($resObj->getTasks() as $resTask) {
-              $parts = explode('/', $resTask->getName());
-              $names[] = end($parts);
-            }
-          }
-
-          $metadata = method_exists($response, 'getMetadata') ? $response->getMetadata() : null;
-          $exception = null;
-          if ($metadata && method_exists($metadata, 'getFailedRequests') && $metadata->getFailedRequests()) {
-            foreach ($chunk as $idx => $task) {
-              if ($metadata->getFailedRequests()->offsetExists($idx)) {
-                $errStatus = $metadata->getFailedRequests()->offsetGet($idx);
-                $code = $errStatus->getCode();
-                $msg = $errStatus->getMessage();
-                if (self::isAlreadyExistsError($code, $msg)) {
-                  $exception = new TaskAlreadyExistsException('Task exists already: ' . $msg);
-                } else {
-                  throw new TaskQueueException('Task creation failed: ' . $msg);
-                }
-              }
-            }
-          }
-          if ($exception !== null) {
-            throw $exception;
-          }
+          self::processBatchCreateResponse($response, $chunk, $names);
         } catch (\Google\ApiCore\ApiException $e) {
           if ($e->getStatus() === 'ALREADY_EXISTS' || $e->getCode() === 409 || self::isAlreadyExistsError($e->getCode(), $e->getMessage())) {
             throw new TaskAlreadyExistsException('Task exists already: ' . $e->getMessage());
@@ -647,7 +678,7 @@ final class PushQueue {
   }
 
   private static function isAlreadyExistsError($errCode, $errMsg) {
-    if ($errCode === 6 || $errCode === 409 || stripos($errMsg, 'already exists') !== false) {
+    if ($errCode === 6 || $errCode === 409 || stripos($errMsg, 'already exists') !== false || stripos($errMsg, 'existed too recently') !== false) {
       return true;
     }
     if (($errCode === 5 || $errCode === 404) && (stripos($errMsg, 'Requested entity was not found') !== false || stripos($errMsg, 'tombstoned') !== false)) {

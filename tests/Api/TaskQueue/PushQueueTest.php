@@ -278,4 +278,90 @@ class PushQueueTest extends ApiProxyTestBase {
     $this->apiProxyMock->verify();
   }
 
+  public function testCloudTasksV2BatchCreateTasksViaGetResult() {
+    putenv('APPENGINE_USE_CLOUDTASK_PUSH_QUEUE=true');
+    putenv('GOOGLE_CLOUD_PROJECT=test-proj');
+    putenv('LOCATION_ID=us-central1');
+    try {
+      PushQueue::setCloudTasksClientFactory(function ($className) {
+        return new class {
+          public function batchCreateTasks($req) {
+            return new class {
+              public function isDone() { return true; }
+              public function pollUntilComplete() { return true; }
+              public function operationFailed() { return false; }
+              public function getMetadata() {
+                return new \Google\Cloud\Tasks\V2\BatchCreateTasksMetadata();
+              }
+              public function getResult() {
+                $t1 = (new \Google\Cloud\Tasks\V2\Task())
+                    ->setName('projects/test-proj/locations/us-central1/queues/default/tasks/task-1');
+                $t2 = (new \Google\Cloud\Tasks\V2\Task())
+                    ->setName('projects/test-proj/locations/us-central1/queues/default/tasks/task-2');
+                return (new \Google\Cloud\Tasks\V2\BatchCreateTasksResponse())
+                    ->setTasks([$t1, $t2]);
+              }
+            };
+          }
+          public function close() {}
+        };
+      });
+
+      $task1 = new PushTask('/url1', ['k' => 'v1'], ['name' => 'task-1']);
+      $task2 = new PushTask('/url2', ['k' => 'v2'], ['name' => 'task-2']);
+      $queue = new PushQueue('default');
+      $names = $queue->addTasks([$task1, $task2]);
+      $this->assertEquals(['task-1', 'task-2'], $names);
+    } finally {
+      PushQueue::setCloudTasksClientFactory(null);
+      putenv('APPENGINE_USE_CLOUDTASK_PUSH_QUEUE');
+      putenv('GOOGLE_CLOUD_PROJECT');
+      putenv('LOCATION_ID');
+    }
+  }
+
+  public function testCloudTasksV2BatchCreateTasksFailedRequestsAlreadyExists() {
+    putenv('APPENGINE_USE_CLOUDTASK_PUSH_QUEUE=true');
+    putenv('GOOGLE_CLOUD_PROJECT=test-proj');
+    putenv('LOCATION_ID=us-central1');
+    try {
+      PushQueue::setCloudTasksClientFactory(function ($className) {
+        return new class {
+          public function batchCreateTasks($req) {
+            return new class {
+              public function isDone() { return true; }
+              public function pollUntilComplete() { return true; }
+              public function operationFailed() { return false; }
+              public function getMetadata() {
+                $st = (new \Google\Rpc\Status())
+                    ->setCode(6)
+                    ->setMessage('The task cannot be created because a task with this name existed too recently');
+                return (new \Google\Cloud\Tasks\V2\BatchCreateTasksMetadata())
+                    ->setFailedRequests([1 => $st]);
+              }
+              public function getResult() {
+                $t1 = (new \Google\Cloud\Tasks\V2\Task())
+                    ->setName('projects/test-proj/locations/us-central1/queues/default/tasks/task-1');
+                return (new \Google\Cloud\Tasks\V2\BatchCreateTasksResponse())
+                    ->setTasks([$t1]);
+              }
+            };
+          }
+          public function close() {}
+        };
+      });
+
+      $this->expectException('\Google\AppEngine\Api\TaskQueue\TaskAlreadyExistsException');
+      $task1 = new PushTask('/url1');
+      $task2 = new PushTask('/url2', [], ['name' => 'dup-task']);
+      $queue = new PushQueue('default');
+      $queue->addTasks([$task1, $task2]);
+    } finally {
+      PushQueue::setCloudTasksClientFactory(null);
+      putenv('APPENGINE_USE_CLOUDTASK_PUSH_QUEUE');
+      putenv('GOOGLE_CLOUD_PROJECT');
+      putenv('LOCATION_ID');
+    }
+  }
+
 }

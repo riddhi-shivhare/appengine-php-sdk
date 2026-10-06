@@ -21,7 +21,7 @@
         "php-mock/php-mock-phpunit": "^2.6"
     },
     "suggest": {
-        "google/cloud-tasks": "Required to use Cloud Tasks push queue routing (^2.0)."
+        "google/cloud-tasks": "Required to use Cloud Tasks push queue routing (^2.3)."
     },
     "autoload": {
         "psr-4": {
