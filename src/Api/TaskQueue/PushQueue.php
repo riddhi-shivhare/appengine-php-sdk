@@ -356,12 +356,27 @@ final class PushQueue {
     $taskObj->setAppEngineHttpRequest($appEngineReq);
 
     if ($task->getDelaySeconds() > 0) {
-      $ts = new \Google\Protobuf\Timestamp();
-      $ts->setSeconds(time() + $task->getDelaySeconds());
-      $taskObj->setScheduleTime($ts);
+      $taskObj->setScheduleTime(self::buildScheduleTime($task->getDelaySeconds()));
     }
 
     return $taskObj;
+  }
+
+  /**
+   * Builds a Timestamp for now + $delaySeconds, preserving fractional seconds.
+   */
+  private static function buildScheduleTime($delaySeconds) {
+    $scheduleTime = microtime(true) + $delaySeconds;
+    $seconds = (int) floor($scheduleTime);
+    $nanos = (int) round(($scheduleTime - $seconds) * 1e9);
+    if ($nanos >= 1000000000) {
+      $seconds += 1;
+      $nanos -= 1000000000;
+    }
+    $ts = new \Google\Protobuf\Timestamp();
+    $ts->setSeconds($seconds);
+    $ts->setNanos($nanos);
+    return $ts;
   }
 
   private function buildCloudTaskObjV2beta3($task, $fullQueueName) {
@@ -431,83 +446,75 @@ final class PushQueue {
     $taskObj->setAppEngineHttpRequest($appEngineReq);
 
     if ($task->getDelaySeconds() > 0) {
-      $ts = new \Google\Protobuf\Timestamp();
-      $ts->setSeconds(time() + $task->getDelaySeconds());
-      $taskObj->setScheduleTime($ts);
+      $taskObj->setScheduleTime(self::buildScheduleTime($task->getDelaySeconds()));
     }
 
     return $taskObj;
   }
 
-  private function createSingleTaskCloudTasks($task, $fullQueueName) {
-    if (class_exists('\Google\Cloud\Tasks\V2\Client\CloudTasksClient')) {
+  /**
+   * Returns [clientClass, apiVersion, usesRequestObjects] for the newest Cloud
+   * Tasks client installed, or null if no Cloud Tasks client is available.
+   */
+  private static function singleTaskClientSpec() {
+    $candidates = [
+      ['\Google\Cloud\Tasks\V2\Client\CloudTasksClient', 'V2', true],
+      ['\Google\Cloud\Tasks\V2\CloudTasksClient', 'V2', false],
+      ['\Google\Cloud\Tasks\V2beta3\Client\CloudTasksClient', 'V2beta3', true],
+      ['\Google\Cloud\Tasks\V2beta3\CloudTasksClient', 'V2beta3', false],
+    ];
+    foreach ($candidates as $candidate) {
+      if (class_exists($candidate[0])) {
+        return $candidate;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Creates a single task. If $client is null, a client is created and closed
+   * within this call; otherwise the caller owns the client's lifecycle.
+   */
+  private function createSingleTaskCloudTasks($task, $fullQueueName, $client = null) {
+    $spec = self::singleTaskClientSpec();
+    if ($spec === null) {
+      throw new TaskQueueException('Cloud Tasks Client SDK is not available.');
+    }
+    list($clientClass, $apiVersion, $usesRequestObjects) = $spec;
+
+    if ($apiVersion === 'V2') {
       $taskObj = $this->buildCloudTaskObjV2($task, $fullQueueName);
-      $client = self::newCloudTasksClient('\Google\Cloud\Tasks\V2\Client\CloudTasksClient');
-      $createTaskReq = (new \Google\Cloud\Tasks\V2\CreateTaskRequest())
-          ->setParent($fullQueueName)
-          ->setTask($taskObj);
-      try {
-        $response = $client->createTask($createTaskReq);
-        $parts = explode('/', $response->getName());
-        return [end($parts)];
-      } catch (\Google\ApiCore\ApiException $e) {
-        if ($e->getStatus() === 'ALREADY_EXISTS' || $e->getCode() === 409 || self::isAlreadyExistsError($e->getCode(), $e->getMessage())) {
-          throw new TaskAlreadyExistsException('Task exists already: ' . $e->getMessage());
-        }
-        throw new TaskQueueException('Cloud Tasks Client SDK createTask failed: ' . $e->getMessage());
-      } finally {
-        $client->close();
-      }
-    } elseif (class_exists('\Google\Cloud\Tasks\V2\CloudTasksClient')) {
-      $taskObj = $this->buildCloudTaskObjV2($task, $fullQueueName);
-      $client = self::newCloudTasksClient('\Google\Cloud\Tasks\V2\CloudTasksClient');
-      try {
-        $response = $client->createTask($fullQueueName, $taskObj);
-        $parts = explode('/', $response->getName());
-        return [end($parts)];
-      } catch (\Google\ApiCore\ApiException $e) {
-        if ($e->getStatus() === 'ALREADY_EXISTS' || $e->getCode() === 409 || self::isAlreadyExistsError($e->getCode(), $e->getMessage())) {
-          throw new TaskAlreadyExistsException('Task exists already: ' . $e->getMessage());
-        }
-        throw new TaskQueueException('Cloud Tasks Client SDK createTask failed: ' . $e->getMessage());
-      } finally {
-        $client->close();
-      }
-    } elseif (class_exists('\Google\Cloud\Tasks\V2beta3\Client\CloudTasksClient')) {
+      $requestClass = '\Google\Cloud\Tasks\V2\CreateTaskRequest';
+    } else {
       $taskObj = $this->buildCloudTaskObjV2beta3($task, $fullQueueName);
-      $client = self::newCloudTasksClient('\Google\Cloud\Tasks\V2beta3\Client\CloudTasksClient');
-      $createTaskReq = (new \Google\Cloud\Tasks\V2beta3\CreateTaskRequest())
-          ->setParent($fullQueueName)
-          ->setTask($taskObj);
-      try {
+      $requestClass = '\Google\Cloud\Tasks\V2beta3\CreateTaskRequest';
+    }
+
+    $ownsClient = ($client === null);
+    if ($ownsClient) {
+      $client = self::newCloudTasksClient($clientClass);
+    }
+    try {
+      if ($usesRequestObjects) {
+        $createTaskReq = (new $requestClass())
+            ->setParent($fullQueueName)
+            ->setTask($taskObj);
         $response = $client->createTask($createTaskReq);
-        $parts = explode('/', $response->getName());
-        return [end($parts)];
-      } catch (\Google\ApiCore\ApiException $e) {
-        if ($e->getStatus() === 'ALREADY_EXISTS' || $e->getCode() === 409 || self::isAlreadyExistsError($e->getCode(), $e->getMessage())) {
-          throw new TaskAlreadyExistsException('Task exists already: ' . $e->getMessage());
-        }
-        throw new TaskQueueException('Cloud Tasks Client SDK createTask failed: ' . $e->getMessage());
-      } finally {
-        $client->close();
-      }
-    } elseif (class_exists('\Google\Cloud\Tasks\V2beta3\CloudTasksClient')) {
-      $taskObj = $this->buildCloudTaskObjV2beta3($task, $fullQueueName);
-      $client = self::newCloudTasksClient('\Google\Cloud\Tasks\V2beta3\CloudTasksClient');
-      try {
+      } else {
         $response = $client->createTask($fullQueueName, $taskObj);
-        $parts = explode('/', $response->getName());
-        return [end($parts)];
-      } catch (\Google\ApiCore\ApiException $e) {
-        if ($e->getStatus() === 'ALREADY_EXISTS' || $e->getCode() === 409 || self::isAlreadyExistsError($e->getCode(), $e->getMessage())) {
-          throw new TaskAlreadyExistsException('Task exists already: ' . $e->getMessage());
-        }
-        throw new TaskQueueException('Cloud Tasks Client SDK createTask failed: ' . $e->getMessage());
-      } finally {
+      }
+      $parts = explode('/', $response->getName());
+      return [end($parts)];
+    } catch (\Google\ApiCore\ApiException $e) {
+      if ($e->getStatus() === 'ALREADY_EXISTS' || $e->getCode() === 409 || self::isAlreadyExistsError($e->getCode(), $e->getMessage())) {
+        throw new TaskAlreadyExistsException('Task exists already: ' . $e->getMessage());
+      }
+      throw new TaskQueueException('Cloud Tasks Client SDK createTask failed: ' . $e->getMessage());
+    } finally {
+      if ($ownsClient) {
         $client->close();
       }
     }
-    throw new TaskQueueException('Cloud Tasks Client SDK is not available.');
   }
 
   private static function processBatchCreateResponse($response, $chunk, &$names) {
@@ -583,40 +590,43 @@ final class PushQueue {
     }
 
     if ($v2ClientClass !== null) {
-      foreach ($chunks as $chunk) {
-        $createTaskRequests = [];
-        foreach ($chunk as $task) {
-          $taskObj = $this->buildCloudTaskObjV2($task, $fullQueueName);
-          $createTaskReq = (new \Google\Cloud\Tasks\V2\CreateTaskRequest())
-              ->setParent($fullQueueName)
-              ->setTask($taskObj);
-          $createTaskRequests[] = $createTaskReq;
-        }
-
-        $client = self::newCloudTasksClient($v2ClientClass);
-        try {
-          if (class_exists('\Google\Cloud\Tasks\V2\BatchCreateTasksRequest')) {
-            $batchReq = (new \Google\Cloud\Tasks\V2\BatchCreateTasksRequest())
+      // Create the client once and reuse it for every chunk.
+      $client = self::newCloudTasksClient($v2ClientClass);
+      try {
+        foreach ($chunks as $chunk) {
+          $createTaskRequests = [];
+          foreach ($chunk as $task) {
+            $taskObj = $this->buildCloudTaskObjV2($task, $fullQueueName);
+            $createTaskReq = (new \Google\Cloud\Tasks\V2\CreateTaskRequest())
                 ->setParent($fullQueueName)
-                ->setRequests($createTaskRequests);
-            try {
-              $response = $client->batchCreateTasks($batchReq);
-            } catch (\TypeError $te) {
+                ->setTask($taskObj);
+            $createTaskRequests[] = $createTaskReq;
+          }
+
+          try {
+            if (class_exists('\Google\Cloud\Tasks\V2\BatchCreateTasksRequest')) {
+              $batchReq = (new \Google\Cloud\Tasks\V2\BatchCreateTasksRequest())
+                  ->setParent($fullQueueName)
+                  ->setRequests($createTaskRequests);
+              try {
+                $response = $client->batchCreateTasks($batchReq);
+              } catch (\TypeError $te) {
+                $response = $client->batchCreateTasks($fullQueueName, $createTaskRequests);
+              }
+            } else {
               $response = $client->batchCreateTasks($fullQueueName, $createTaskRequests);
             }
-          } else {
-            $response = $client->batchCreateTasks($fullQueueName, $createTaskRequests);
-          }
 
-          self::processBatchCreateResponse($response, $chunk, $names);
-        } catch (\Google\ApiCore\ApiException $e) {
-          if ($e->getStatus() === 'ALREADY_EXISTS' || $e->getCode() === 409 || self::isAlreadyExistsError($e->getCode(), $e->getMessage())) {
-            throw new TaskAlreadyExistsException('Task exists already: ' . $e->getMessage());
+            self::processBatchCreateResponse($response, $chunk, $names);
+          } catch (\Google\ApiCore\ApiException $e) {
+            if ($e->getStatus() === 'ALREADY_EXISTS' || $e->getCode() === 409 || self::isAlreadyExistsError($e->getCode(), $e->getMessage())) {
+              throw new TaskAlreadyExistsException('Task exists already: ' . $e->getMessage());
+            }
+            throw new TaskQueueException('Cloud Tasks Client SDK batchCreate failed: ' . $e->getMessage());
           }
-          throw new TaskQueueException('Cloud Tasks Client SDK batchCreate failed: ' . $e->getMessage());
-        } finally {
-          $client->close();
         }
+      } finally {
+        $client->close();
       }
       return $names;
     }
@@ -630,60 +640,72 @@ final class PushQueue {
     }
 
     if ($betaClientClass !== null) {
-      foreach ($chunks as $chunk) {
-        $createTaskRequests = [];
-        foreach ($chunk as $task) {
-          $taskObj = $this->buildCloudTaskObjV2beta3($task, $fullQueueName);
-          $createTaskReq = new \Google\Cloud\Tasks\V2beta3\CreateTaskRequest();
-          $createTaskReq->setParent($fullQueueName);
-          $createTaskReq->setTask($taskObj);
-          $createTaskRequests[] = $createTaskReq;
-        }
+      // Create the client once and reuse it for every chunk.
+      $client = self::newCloudTasksClient($betaClientClass);
+      try {
+        foreach ($chunks as $chunk) {
+          $createTaskRequests = [];
+          foreach ($chunk as $task) {
+            $taskObj = $this->buildCloudTaskObjV2beta3($task, $fullQueueName);
+            $createTaskReq = new \Google\Cloud\Tasks\V2beta3\CreateTaskRequest();
+            $createTaskReq->setParent($fullQueueName);
+            $createTaskReq->setTask($taskObj);
+            $createTaskRequests[] = $createTaskReq;
+          }
 
-        $client = self::newCloudTasksClient($betaClientClass);
-        try {
-          if (class_exists('\Google\Cloud\Tasks\V2beta3\BatchCreateTasksRequest')) {
-            $batchReq = (new \Google\Cloud\Tasks\V2beta3\BatchCreateTasksRequest())
-                ->setParent($fullQueueName)
-                ->setRequests($createTaskRequests);
-            try {
-              $response = $client->batchCreateTasks($batchReq);
-            } catch (\TypeError $te) {
+          try {
+            if (class_exists('\Google\Cloud\Tasks\V2beta3\BatchCreateTasksRequest')) {
+              $batchReq = (new \Google\Cloud\Tasks\V2beta3\BatchCreateTasksRequest())
+                  ->setParent($fullQueueName)
+                  ->setRequests($createTaskRequests);
+              try {
+                $response = $client->batchCreateTasks($batchReq);
+              } catch (\TypeError $te) {
+                $response = $client->batchCreateTasks($fullQueueName, $createTaskRequests);
+              }
+            } else {
               $response = $client->batchCreateTasks($fullQueueName, $createTaskRequests);
             }
-          } else {
-            $response = $client->batchCreateTasks($fullQueueName, $createTaskRequests);
-          }
 
-          self::processBatchCreateResponse($response, $chunk, $names);
-        } catch (\Google\ApiCore\ApiException $e) {
-          if ($e->getStatus() === 'ALREADY_EXISTS' || $e->getCode() === 409 || self::isAlreadyExistsError($e->getCode(), $e->getMessage())) {
-            throw new TaskAlreadyExistsException('Task exists already: ' . $e->getMessage());
+            self::processBatchCreateResponse($response, $chunk, $names);
+          } catch (\Google\ApiCore\ApiException $e) {
+            if ($e->getStatus() === 'ALREADY_EXISTS' || $e->getCode() === 409 || self::isAlreadyExistsError($e->getCode(), $e->getMessage())) {
+              throw new TaskAlreadyExistsException('Task exists already: ' . $e->getMessage());
+            }
+            throw new TaskQueueException('Cloud Tasks Client SDK batchCreate failed: ' . $e->getMessage());
           }
-          throw new TaskQueueException('Cloud Tasks Client SDK batchCreate failed: ' . $e->getMessage());
-        } finally {
-          $client->close();
         }
+      } finally {
+        $client->close();
       }
       return $names;
     }
 
     // Fallback: If native batchCreateTasks is not available in the installed Cloud Tasks SDK,
-    // enqueue tasks individually using createTask.
-    foreach ($tasks as $task) {
-      $res = $this->createSingleTaskCloudTasks($task, $fullQueueName);
-      $names[] = $res[0];
+    // enqueue tasks individually using createTask over a single shared client.
+    $spec = self::singleTaskClientSpec();
+    if ($spec === null) {
+      throw new TaskQueueException('Cloud Tasks Client SDK is not available.');
+    }
+    $client = self::newCloudTasksClient($spec[0]);
+    try {
+      foreach ($tasks as $task) {
+        $res = $this->createSingleTaskCloudTasks($task, $fullQueueName, $client);
+        $names[] = $res[0];
+      }
+    } finally {
+      $client->close();
     }
     return $names;
   }
 
   private static function isAlreadyExistsError($errCode, $errMsg) {
-    if ($errCode === 6 || $errCode === 409 || stripos($errMsg, 'already exists') !== false || stripos($errMsg, 'existed too recently') !== false) {
-      return true;
-    }
-    if (($errCode === 5 || $errCode === 404) && (stripos($errMsg, 'Requested entity was not found') !== false || stripos($errMsg, 'tombstoned') !== false)) {
-      return true;
-    }
-    return false;
+    // Cloud Tasks reports duplicate and tombstoned task names as ALREADY_EXISTS.
+    // NOT_FOUND is intentionally not mapped here so that missing queues,
+    // projects or locations surface as TaskQueueException.
+    return $errCode === 6 || $errCode === 409 ||
+        stripos($errMsg, 'already exists') !== false ||
+        stripos($errMsg, 'existed too recently') !== false ||
+        stripos($errMsg, 'tombstoned') !== false;
   }
 }
