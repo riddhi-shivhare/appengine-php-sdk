@@ -575,6 +575,10 @@ final class PushQueue {
   }
 
   private static function processBatchCreateResponse($response, $tasks, &$names) {
+    if (method_exists($response, 'isDone') && !$response->isDone()) {
+      throw new TaskQueueException('Cloud Tasks batch create operation returned done=false');
+    }
+
     $resObj = method_exists($response, 'getResult') ? $response->getResult() :
         (method_exists($response, 'getResponse') ? $response->getResponse() : $response);
     if ($resObj && method_exists($resObj, 'getTasks')) {

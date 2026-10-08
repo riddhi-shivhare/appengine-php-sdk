@@ -1067,4 +1067,31 @@ class PushQueueTest extends ApiProxyTestBase {
     }
   }
 
+  public function testCloudTasksV2BatchCreateTasksNotDoneThrowsWithoutPolling() {
+    self::ensureCloudTasksV2StubsLoaded();
+    self::setCloudTasksEnv();
+    try {
+      PushQueue::setCloudTasksClientFactory(function ($className) {
+        return new class {
+          public function batchCreateTasks($req) {
+            return new class {
+              public function isDone() { return false; }
+              public function pollUntilComplete() {
+                throw new \RuntimeException('pollUntilComplete should never be called');
+              }
+            };
+          }
+          public function close() {}
+        };
+      });
+
+      $this->expectException(TaskQueueException::class);
+      $this->expectExceptionMessage('Cloud Tasks batch create operation returned done=false');
+      $queue = new PushQueue('default');
+      $queue->addTasks([new PushTask('/a'), new PushTask('/b')]);
+    } finally {
+      self::clearCloudTasksEnv();
+    }
+  }
+
 }
